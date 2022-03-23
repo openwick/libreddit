@@ -1,13 +1,6 @@
 // Global specifiers
 #![forbid(unsafe_code)]
-#![warn(clippy::pedantic, clippy::all)]
-#![allow(
-	clippy::needless_pass_by_value,
-	clippy::cast_possible_truncation,
-	clippy::cast_possible_wrap,
-	clippy::manual_find_map,
-	clippy::unused_async
-)]
+#![allow(clippy::cmp_owned)]
 
 // Reference local files
 mod post;
@@ -18,7 +11,7 @@ mod user;
 mod utils;
 
 // Import Crates
-use clap::{App as cli, Arg};
+use clap::{Command, Arg};
 
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
@@ -70,6 +63,7 @@ async fn font() -> Result<Response<Body>, String> {
 		Response::builder()
 			.status(200)
 			.header("content-type", "font/woff2")
+			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
 			.body(include_bytes!("../static/Inter.var.woff2").as_ref().into())
 			.unwrap_or_default(),
 	)
@@ -93,19 +87,19 @@ async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Respons
 
 #[tokio::main]
 async fn main() {
-	let matches = cli::new("Libreddit")
+	let matches = Command::new("Libreddit")
 		.version(env!("CARGO_PKG_VERSION"))
 		.about("Private front-end for Reddit written in Rust ")
 		.arg(
-			Arg::with_name("redirect-https")
-				.short("r")
+			Arg::new("redirect-https")
+				.short('r')
 				.long("redirect-https")
 				.help("Redirect all HTTP requests to HTTPS (no longer functional)")
 				.takes_value(false),
 		)
 		.arg(
-			Arg::with_name("address")
-				.short("a")
+			Arg::new("address")
+				.short('a')
 				.long("address")
 				.value_name("ADDRESS")
 				.help("Sets address to listen on")
@@ -113,8 +107,8 @@ async fn main() {
 				.takes_value(true),
 		)
 		.arg(
-			Arg::with_name("port")
-				.short("p")
+			Arg::new("port")
+				.short('p')
 				.long("port")
 				.value_name("PORT")
 				.help("Port to listen on")
@@ -122,8 +116,8 @@ async fn main() {
 				.takes_value(true),
 		)
 		.arg(
-			Arg::with_name("hsts")
-				.short("H")
+			Arg::new("hsts")
+				.short('H')
 				.long("hsts")
 				.value_name("EXPIRE_TIME")
 				.help("HSTS header to tell browsers that this site should only be accessed over HTTPS")
@@ -133,8 +127,7 @@ async fn main() {
 		.get_matches();
 
 	let address = matches.value_of("address").unwrap_or("0.0.0.0");
-	let port = std::env::var("PORT")
-        .unwrap_or_else(|_| matches.value_of("port").unwrap_or("8080").to_string());
+	let port = std::env::var("PORT").unwrap_or_else(|_| matches.value_of("port").unwrap_or("8080").to_string());
 	let hsts = matches.value_of("hsts");
 
 	let listener = [address, ":", &port].concat();
@@ -181,9 +174,12 @@ async fn main() {
 	// Proxy media through Libreddit
 	app.at("/vid/:id/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
-	app.at("/img/:id").get(|r| proxy(r, "https://i.redd.it/{id}").boxed());
+	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
 	app.at("/emoji/:id/:name").get(|r| proxy(r, "https://emoji.redditmedia.com/{id}/{name}").boxed());
+	app
+		.at("/preview/:loc/award_images/:fullname/:id")
+		.get(|r| proxy(r, "https://{loc}view.redd.it/award_images/{fullname}/{id}").boxed());
 	app.at("/preview/:loc/:id").get(|r| proxy(r, "https://{loc}view.redd.it/{id}").boxed());
 	app.at("/style/*path").get(|r| proxy(r, "https://styles.redditmedia.com/{path}").boxed());
 	app.at("/static/*path").get(|r| proxy(r, "https://www.redditstatic.com/{path}").boxed());
@@ -197,6 +193,7 @@ async fn main() {
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account".to_string()).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
+	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
@@ -216,8 +213,10 @@ async fn main() {
 		.at("/r/u_:name")
 		.get(|r| async move { Ok(redirect(format!("/user/{}", r.param("name").unwrap_or_default()))) }.boxed());
 
-	app.at("/r/:sub/subscribe").post(|r| subreddit::subscriptions(r).boxed());
-	app.at("/r/:sub/unsubscribe").post(|r| subreddit::subscriptions(r).boxed());
+	app.at("/r/:sub/subscribe").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/r/:sub/unsubscribe").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/r/:sub/filter").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/r/:sub/unfilter").post(|r| subreddit::subscriptions_filters(r).boxed());
 
 	app.at("/r/:sub/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/r/:sub/comments/:id/:title").get(|r| post::item(r).boxed());

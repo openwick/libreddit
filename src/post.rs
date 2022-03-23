@@ -3,11 +3,13 @@ use crate::client::json;
 use crate::esc;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
-use crate::utils::{error, format_num, format_url, param, rewrite_urls, setting, template, time, val, Author, Comment, Flags, Flair, FlairPart, Media, Post, Preferences};
-
+use crate::utils::{
+	error, format_num, format_url, get_filters, param, rewrite_urls, setting, template, time, val, Author, Awards, Comment, Flags, Flair, FlairPart, Media, Post, Preferences,
+};
 use hyper::{Body, Request, Response};
 
 use askama::Template;
+use std::collections::HashSet;
 
 // STRUCTS
 #[derive(Template)]
@@ -18,6 +20,7 @@ struct PostTemplate {
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
+	url: String,
 }
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -53,7 +56,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		Ok(response) => {
 			// Parse the JSON into Post and Comment structs
 			let post = parse_post(&response[0]).await;
-			let comments = parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment);
+			let comments = parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req));
+			let url = req.uri().to_string();
 
 			// Use the Post and Comment structs to generate a website to show users
 			template(PostTemplate {
@@ -62,6 +66,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				sort,
 				prefs: Preferences::new(req),
 				single_thread,
+				url,
 			})
 		}
 		// If the Reddit API returns an error, exit and send error page to user
@@ -90,12 +95,22 @@ async fn parse_post(json: &serde_json::Value) -> Post {
 	// Determine the type of media along with the media URL
 	let (post_type, media, gallery) = Media::parse(&post["data"]).await;
 
+	let awards: Awards = Awards::parse(&post["data"]["all_awardings"]);
+
+	let permalink = val(post, "permalink");
+
+	let body = if val(post, "removed_by_category") == "moderator" {
+		format!("<div class=\"md\"><p>[removed] — <a href=\"https://www.reveddit.com{}\">view removed post</a></p></div>", permalink)
+	} else {
+		rewrite_urls(&val(post, "selftext_html")).replace("\\", "")
+	};
+
 	// Build a post using data parsed from Reddit post API
 	Post {
 		id: val(post, "id"),
 		title: esc!(post, "title"),
 		community: val(post, "subreddit"),
-		body: rewrite_urls(&val(post, "selftext_html")).replace("\\", ""),
+		body,
 		author: Author {
 			name: val(post, "author"),
 			flair: Flair {
@@ -110,7 +125,7 @@ async fn parse_post(json: &serde_json::Value) -> Post {
 			},
 			distinguished: val(post, "distinguished"),
 		},
-		permalink: val(post, "permalink"),
+		permalink,
 		score: format_num(score),
 		upvote_ratio: ratio as i64,
 		post_type,
@@ -145,11 +160,12 @@ async fn parse_post(json: &serde_json::Value) -> Post {
 		created,
 		comments: format_num(post["data"]["num_comments"].as_i64().unwrap_or_default()),
 		gallery,
+		awards,
 	}
 }
 
 // COMMENTS
-fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, highlighted_comment: &str) -> Vec<Comment> {
+fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, highlighted_comment: &str, filters: &HashSet<String>) -> Vec<Comment> {
 	// Parse the comment JSON into a Vector of Comments
 	let comments = json["data"]["children"].as_array().map_or(Vec::new(), std::borrow::ToOwned::to_owned);
 
@@ -166,20 +182,51 @@ fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, 
 			let edited = data["edited"].as_f64().map_or((String::new(), String::new()), time);
 
 			let score = data["score"].as_i64().unwrap_or(0);
-			let body = rewrite_urls(&val(&comment, "body_html"));
 
 			// If this comment contains replies, handle those too
 			let replies: Vec<Comment> = if data["replies"].is_object() {
-				parse_comments(&data["replies"], post_link, post_author, highlighted_comment)
+				parse_comments(&data["replies"], post_link, post_author, highlighted_comment, filters)
 			} else {
 				Vec::new()
 			};
+
+			let awards: Awards = Awards::parse(&data["all_awardings"]);
 
 			let parent_kind_and_id = val(&comment, "parent_id");
 			let parent_info = parent_kind_and_id.split('_').collect::<Vec<&str>>();
 
 			let id = val(&comment, "id");
 			let highlighted = id == highlighted_comment;
+
+			let body = if val(&comment, "author") == "[deleted]" && val(&comment, "body") == "[removed]" {
+				format!("<div class=\"md\"><p>[removed] — <a href=\"https://www.reveddit.com{}{}\">view removed comment</a></p></div>", post_link, id)
+			} else {
+				rewrite_urls(&val(&comment, "body_html")).to_string()
+			};
+
+			let author = Author {
+				name: val(&comment, "author"),
+				flair: Flair {
+					flair_parts: FlairPart::parse(
+						data["author_flair_type"].as_str().unwrap_or_default(),
+						data["author_flair_richtext"].as_array(),
+						data["author_flair_text"].as_str(),
+					),
+					text: esc!(&comment, "link_flair_text"),
+					background_color: val(&comment, "author_flair_background_color"),
+					foreground_color: val(&comment, "author_flair_text_color"),
+				},
+				distinguished: val(&comment, "distinguished"),
+			};
+			let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
+
+			// Many subreddits have a default comment posted about the sub's rules etc.
+			// Many libreddit users do not wish to see this kind of comment by default.
+			// Reddit does not tell us which users are "bots", so a good heuristic is to
+			// collapse stickied moderator comments.
+			let is_moderator_comment = data["distinguished"].as_str().unwrap_or_default() == "moderator";
+			let is_stickied = data["stickied"].as_bool().unwrap_or_default();
+			let collapsed = (is_moderator_comment && is_stickied) || is_filtered;
 
 			Comment {
 				id,
@@ -189,20 +236,7 @@ fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, 
 				post_link: post_link.to_string(),
 				post_author: post_author.to_string(),
 				body,
-				author: Author {
-					name: val(&comment, "author"),
-					flair: Flair {
-						flair_parts: FlairPart::parse(
-							data["author_flair_type"].as_str().unwrap_or_default(),
-							data["author_flair_richtext"].as_array(),
-							data["author_flair_text"].as_str(),
-						),
-						text: esc!(&comment, "link_flair_text"),
-						background_color: val(&comment, "author_flair_background_color"),
-						foreground_color: val(&comment, "author_flair_text_color"),
-					},
-					distinguished: val(&comment, "distinguished"),
-				},
+				author,
 				score: if data["score_hidden"].as_bool().unwrap_or_default() {
 					("\u{2022}".to_string(), "Hidden".to_string())
 				} else {
@@ -213,6 +247,9 @@ fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, 
 				edited,
 				replies,
 				highlighted,
+				awards,
+				collapsed,
+				is_filtered,
 			}
 		})
 		.collect()

@@ -14,6 +14,7 @@ use time::{Duration, OffsetDateTime};
 #[template(path = "settings.html")]
 struct SettingsTemplate {
 	prefs: Preferences,
+	url: String,
 }
 
 // CONSTANTS
@@ -35,7 +36,11 @@ const PREFS: [&str; 10] = [
 
 // Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
-	template(SettingsTemplate { prefs: Preferences::new(req) })
+	let url = req.uri().to_string();
+	template(SettingsTemplate {
+		prefs: Preferences::new(req),
+		url,
+	})
 }
 
 // Set cookies using response "Set-Cookie" header
@@ -104,7 +109,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 
 	let mut response = redirect(path);
 
-	for name in [PREFS.to_vec(), vec!["subscriptions"]].concat() {
+	for name in [PREFS.to_vec(), vec!["subscriptions", "filters"]].concat() {
 		match form.get(name) {
 			Some(value) => response.insert_cookie(
 				Cookie::build(name.to_owned(), value.clone())

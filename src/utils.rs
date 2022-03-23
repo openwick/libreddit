@@ -7,8 +7,9 @@ use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
-use time::{Duration, OffsetDateTime};
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use time::{Duration, OffsetDateTime, macros::format_description};
 use url::Url;
 
 // Post flair with content, background color and foreground color
@@ -20,6 +21,7 @@ pub struct Flair {
 }
 
 // Part of flair, either emoji or text
+#[derive(Clone)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -73,6 +75,7 @@ pub struct Flags {
 	pub stickied: bool,
 }
 
+#[derive(Debug)]
 pub struct Media {
 	pub url: String,
 	pub alt_url: String,
@@ -85,28 +88,29 @@ impl Media {
 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
 		let mut gallery = Vec::new();
 
+		// Define the various known places that Reddit might put video URLs.
+		let data_preview = &data["preview"]["reddit_video_preview"];
+		let secure_media = &data["secure_media"]["reddit_video"];
+		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
+
 		// If post is a video, return the video
-		let (post_type, url_val, alt_url_val) = if data["preview"]["reddit_video_preview"]["fallback_url"].is_string() {
-			// Return reddit video
+		let (post_type, url_val, alt_url_val) = if data_preview["fallback_url"].is_string() {
 			(
-				if data["preview"]["reddit_video_preview"]["is_gif"].as_bool().unwrap_or(false) {
-					"gif"
-				} else {
-					"video"
-				},
-				&data["preview"]["reddit_video_preview"]["fallback_url"],
-				Some(&data["preview"]["reddit_video_preview"]["hls_url"]),
+				if data_preview["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&data_preview["fallback_url"],
+				Some(&data_preview["hls_url"]),
 			)
-		} else if data["secure_media"]["reddit_video"]["fallback_url"].is_string() {
-			// Return reddit video
+		} else if secure_media["fallback_url"].is_string() {
 			(
-				if data["preview"]["reddit_video_preview"]["is_gif"].as_bool().unwrap_or(false) {
-					"gif"
-				} else {
-					"video"
-				},
-				&data["secure_media"]["reddit_video"]["fallback_url"],
-				Some(&data["secure_media"]["reddit_video"]["hls_url"]),
+				if secure_media["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&secure_media["fallback_url"],
+				Some(&secure_media["hls_url"]),
+			)
+		} else if crosspost_parent_media["fallback_url"].is_string() {
+			(
+				if crosspost_parent_media["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&crosspost_parent_media["fallback_url"],
+				Some(&crosspost_parent_media["hls_url"]),
 			)
 		} else if data["post_hint"].as_str().unwrap_or("") == "image" {
 			// Handle images, whether GIFs or pics
@@ -139,18 +143,12 @@ impl Media {
 
 		let source = &data["preview"]["images"][0]["source"];
 
-		let url = if post_type == "self" || post_type == "link" {
-			url_val.as_str().unwrap_or_default().to_string()
-		} else {
-			format_url(url_val.as_str().unwrap_or_default())
-		};
-
 		let alt_url = alt_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 
 		(
 			post_type.to_string(),
 			Self {
-				url,
+				url: format_url(url_val.as_str().unwrap_or_default()),
 				alt_url,
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
@@ -213,11 +211,12 @@ pub struct Post {
 	pub created: String,
 	pub comments: (String, String),
 	pub gallery: Vec<GalleryMedia>,
+	pub awards: Awards,
 }
 
 impl Post {
 	// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
-	pub async fn fetch(path: &str, fallback_title: String, quarantine: bool) -> Result<(Vec<Self>, String), String> {
+	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
 		let res;
 		let post_list;
 
@@ -250,12 +249,19 @@ impl Post {
 
 			// Determine the type of media along with the media URL
 			let (post_type, media, gallery) = Media::parse(data).await;
+			let awards = Awards::parse(&data["all_awardings"]);
+
+			// selftext_html is set for text posts when browsing.
+			let mut body = rewrite_urls(&val(post, "selftext_html"));
+			if body.is_empty() {
+				body = rewrite_urls(&val(post, "body_html"));
+			}
 
 			posts.push(Self {
 				id: val(post, "id"),
-				title: esc!(if title.is_empty() { fallback_title.clone() } else { title }),
+				title,
 				community: val(post, "subreddit"),
-				body: rewrite_urls(&val(post, "body_html")),
+				body,
 				author: Author {
 					name: val(post, "author"),
 					flair: Flair {
@@ -309,6 +315,7 @@ impl Post {
 				created,
 				comments: format_num(data["num_comments"].as_i64().unwrap_or_default()),
 				gallery,
+				awards,
 			});
 		}
 
@@ -334,6 +341,62 @@ pub struct Comment {
 	pub edited: (String, String),
 	pub replies: Vec<Comment>,
 	pub highlighted: bool,
+	pub awards: Awards,
+	pub collapsed: bool,
+	pub is_filtered: bool,
+}
+
+#[derive(Default, Clone)]
+pub struct Award {
+	pub name: String,
+	pub icon_url: String,
+	pub description: String,
+	pub count: i64,
+}
+
+impl std::fmt::Display for Award {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "{} {} {}", self.name, self.icon_url, self.description)
+	}
+}
+
+pub struct Awards(pub Vec<Award>);
+
+impl std::ops::Deref for Awards {
+	type Target = Vec<Award>;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+impl std::fmt::Display for Awards {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		self.iter().fold(Ok(()), |result, award| result.and_then(|_| writeln!(f, "{}", award)))
+	}
+}
+
+// Convert Reddit awards JSON to Awards struct
+impl Awards {
+	pub fn parse(items: &Value) -> Self {
+		let parsed = items.as_array().unwrap_or(&Vec::new()).iter().fold(Vec::new(), |mut awards, item| {
+			let name = item["name"].as_str().unwrap_or_default().to_string();
+			let icon_url = format_url(item["resized_icons"][0]["url"].as_str().unwrap_or_default());
+			let description = item["description"].as_str().unwrap_or_default().to_string();
+			let count: i64 = i64::from_str(&item["count"].to_string()).unwrap_or(1);
+
+			awards.push(Award {
+				name,
+				icon_url,
+				description,
+				count,
+			});
+
+			awards
+		});
+
+		Self(parsed)
+	}
 }
 
 #[derive(Template)]
@@ -341,6 +404,7 @@ pub struct Comment {
 pub struct ErrorTemplate {
 	pub msg: String,
 	pub prefs: Preferences,
+	pub url: String,
 }
 
 #[derive(Default)]
@@ -392,6 +456,7 @@ pub struct Preferences {
 	pub comment_sort: String,
 	pub post_sort: String,
 	pub subscriptions: Vec<String>,
+	pub filters: Vec<String>,
 }
 
 impl Preferences {
@@ -409,7 +474,25 @@ impl Preferences {
 			comment_sort: setting(&req, "comment_sort"),
 			post_sort: setting(&req, "post_sort"),
 			subscriptions: setting(&req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			filters: setting(&req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
 		}
+	}
+}
+
+/// Gets a `HashSet` of filters from the cookie in the given `Request`.
+pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
+	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+}
+
+/// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being a subreddit name or a user name). If a
+/// `Post`'s subreddit or author is found in the filters, it is removed. Returns `true` if _all_ posts were filtered
+/// out, or `false` otherwise.
+pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> bool {
+	if posts.is_empty() {
+		false
+	} else {
+		posts.retain(|p| !filters.contains(&p.community) && !filters.contains(&["u_", &p.author.name].concat()));
+		posts.is_empty()
 	}
 }
 
@@ -449,7 +532,7 @@ pub fn setting(req: &Request<Body>, name: &str) -> String {
 
 // Detect and redirect in the event of a random subreddit
 pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>, String> {
-	if (sub == "random" || sub == "randnsfw") && !sub.contains('+') {
+	if sub == "random" || sub == "randnsfw" {
 		let new_sub = json(format!("/r/{}/about.json?raw_json=1", sub), false).await?["data"]["display_name"]
 			.as_str()
 			.unwrap_or_default()
@@ -465,7 +548,7 @@ pub fn format_url(url: &str) -> String {
 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
 		String::new()
 	} else {
-		Url::parse(url).map_or(String::new(), |parsed| {
+		Url::parse(url).map_or(url.to_string(), |parsed| {
 			let domain = parsed.domain().unwrap_or_default();
 
 			let capture = |regex: &str, format: &str, segments: i16| {
@@ -500,8 +583,12 @@ pub fn format_url(url: &str) -> String {
 			}
 
 			match domain {
+				"www.reddit.com" => capture(r"https://www\.reddit\.com/(.*)", "/", 1),
+				"old.reddit.com" => capture(r"https://old\.reddit\.com/(.*)", "/", 1),
+				"np.reddit.com" => capture(r"https://np\.reddit\.com/(.*)", "/", 1),
+				"reddit.com" => capture(r"https://reddit\.com/(.*)", "/", 1),
 				"v.redd.it" => chain!(
-					capture(r"https://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$))", "/vid/", 2),
+					capture(r"https://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))", "/vid/", 2),
 					capture(r"https://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$", "/hls/", 2)
 				),
 				"i.redd.it" => capture(r"https://i\.redd\.it/(.*)", "/img/", 1),
@@ -512,7 +599,7 @@ pub fn format_url(url: &str) -> String {
 				"external-preview.redd.it" => capture(r"https://external\-preview\.redd\.it/(.*)", "/preview/external-pre/", 1),
 				"styles.redditmedia.com" => capture(r"https://styles\.redditmedia\.com/(.*)", "/style/", 1),
 				"www.redditstatic.com" => capture(r"https://www\.redditstatic\.com/(.*)", "/static/", 1),
-				_ => String::new(),
+				_ => url.to_string(),
 			}
 		})
 	}
@@ -533,12 +620,14 @@ pub fn rewrite_urls(input_text: &str) -> String {
 	})
 }
 
-// Append `m` and `k` for millions and thousands respectively
+// Format vote count to a string that will be displayed.
+// Append `m` and `k` for millions and thousands respectively, and
+// round to the nearest tenth.
 pub fn format_num(num: i64) -> (String, String) {
 	let truncated = if num >= 1_000_000 || num <= -1_000_000 {
-		format!("{}m", num / 1_000_000)
+		format!("{:.1}m", num as f64 / 1_000_000.0)
 	} else if num >= 1000 || num <= -1000 {
-		format!("{}k", num / 1_000)
+		format!("{:.1}k", num as f64 / 1_000.0)
 	} else {
 		num.to_string()
 	};
@@ -548,12 +637,12 @@ pub fn format_num(num: i64) -> (String, String) {
 
 // Parse a relative and absolute time from a UNIX timestamp
 pub fn time(created: f64) -> (String, String) {
-	let time = OffsetDateTime::from_unix_timestamp(created.round() as i64);
+	let time = OffsetDateTime::from_unix_timestamp(created.round() as i64).unwrap_or(OffsetDateTime::UNIX_EPOCH);
 	let time_delta = OffsetDateTime::now_utc() - time;
 
 	// If the time difference is more than a month, show full date
 	let rel_time = if time_delta > Duration::days(30) {
-		time.format("%b %d '%y")
+		time.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default()
 	// Otherwise, show relative date/time
 	} else if time_delta.whole_days() > 0 {
 		format!("{}d ago", time_delta.whole_days())
@@ -563,7 +652,7 @@ pub fn time(created: f64) -> (String, String) {
 		format!("{}m ago", time_delta.whole_minutes())
 	};
 
-	(rel_time, time.format("%b %d %Y, %H:%M:%S UTC"))
+	(rel_time, time.format(format_description!("[month repr:short] [day] [year], [hour]:[minute]:[second] UTC")).unwrap_or_default())
 }
 
 // val() function used to parse JSON from Reddit APIs
@@ -606,12 +695,28 @@ pub fn redirect(path: String) -> Response<Body> {
 }
 
 pub async fn error(req: Request<Body>, msg: String) -> Result<Response<Body>, String> {
+	let url = req.uri().to_string();
 	let body = ErrorTemplate {
 		msg,
 		prefs: Preferences::new(req),
+		url,
 	}
 	.render()
 	.unwrap_or_default();
 
 	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::format_num;
+
+	#[test]
+	fn format_num_works() {
+		assert_eq!(format_num(567), ("567".to_string(), "567".to_string()));
+		assert_eq!(format_num(1234), ("1.2k".to_string(), "1234".to_string()));
+		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
+		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
+		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
 }
